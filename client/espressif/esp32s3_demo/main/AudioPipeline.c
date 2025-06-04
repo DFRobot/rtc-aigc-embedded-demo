@@ -52,6 +52,16 @@ static const char *TAG = "AUDIO_PIPELINE";
 #define CHANNEL_FORMAT              I2S_CHANNEL_TYPE_RIGHT_LEFT
 #define ALGORITHM_INPUT_FORMAT      "MR"
 #define CHANNEL_NUM                 2
+#elif CONFIG_DFROBOT_ESP32S3_AI_CAM
+#define ALGORITHM_STREAM_SAMPLE_BIT 16
+#define CHANNEL_FORMAT              I2S_CHANNEL_TYPE_ONLY_LEFT
+#define ALGORITHM_INPUT_FORMAT      "MR"
+#define CHANNEL_NUM                 1
+#elif CONFIG_UNIHIKER_K10
+#define ALGORITHM_STREAM_SAMPLE_BIT 16
+#define CHANNEL_FORMAT              I2S_CHANNEL_TYPE_ALL_RIGHT
+#define ALGORITHM_INPUT_FORMAT      "MR"
+#define CHANNEL_NUM                 1
 #endif
 
 #if (RTC_DEMO_AUDIO_PIPELINE_CODEC_OPUS)
@@ -105,6 +115,10 @@ static audio_element_handle_t create_resample_stream(int src_rate, int src_ch, i
     return stream;
 }
 
+#if !RECORD_HARDWARE_AEC
+static ringbuf_handle_t ringbuf_ref;
+#endif
+
 static audio_element_handle_t create_record_i2s_stream(void)
 {
 #if CONFIG_ESP32_S3_KORVO2_V3_BOARD
@@ -112,10 +126,19 @@ static audio_element_handle_t create_record_i2s_stream(void)
 #elif CONFIG_M5STACK_ATOMS3R_BOARD
     es8311_set_mic_gain(ES8311_MIC_GAIN_36DB);
 #endif
+
+#if CONFIG_DFROBOT_ESP32S3_AI_CAM
+    i2s_stream_cfg_t i2s_cfg = I2S_STREAM_PDM_RX_CFG_DEFAULT(); 
+#else
     i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT_WITH_PARA(CODEC_ADC_I2S_PORT, I2S_SAMPLE_RATE, ALGORITHM_STREAM_SAMPLE_BIT, AUDIO_STREAM_READER); // 参数需要仔细检查
+#endif    
     i2s_cfg.type = AUDIO_STREAM_READER;
     i2s_stream_set_channel_type(&i2s_cfg, CHANNEL_FORMAT);
+#if !RECORD_HARDWARE_AEC
+    i2s_cfg.multi_out_num = 1;
+#else
     i2s_cfg.std_cfg.clk_cfg.sample_rate_hz = I2S_SAMPLE_RATE;
+#endif
     return i2s_stream_init(&i2s_cfg);
 }
 
@@ -159,11 +182,19 @@ static audio_element_handle_t create_record_algo_stream(void)
 {
     ESP_LOGI(TAG, "[3.1] Create algorithm stream for aec");
     algorithm_stream_cfg_t algo_config = ALGORITHM_STREAM_CFG_DEFAULT();
-    // algo_config.swap_ch = true;
+    // algo_config.swap_ch = false;
+#if !RECORD_HARDWARE_AEC
+    algo_config.input_type = ALGORITHM_STREAM_INPUT_TYPE2;
+#else
+    algo_config.input_type = ALGORITHM_STREAM_INPUT_TYPE1;
+#endif
     algo_config.sample_rate = ALGO_SAMPLE_RATE;
     algo_config.out_rb_size = 256;
     algo_config.algo_mask = ALGORITHM_STREAM_DEFAULT_MASK | ALGORITHM_STREAM_USE_AGC;
     algo_config.input_format = ALGORITHM_INPUT_FORMAT;
+#if !RECORD_HARDWARE_AEC
+    algo_config.multi_in_rb_num = true;
+#endif
     audio_element_handle_t element_algo = algo_stream_init(&algo_config);
     audio_element_set_music_info(element_algo, ALGO_SAMPLE_RATE, 1, 16);
     audio_element_set_input_timeout(element_algo, portMAX_DELAY);
@@ -199,6 +230,14 @@ recorder_pipeline_handle_t recorder_pipeline_open()
 
     pipeline->raw_reader = create_record_raw_stream();
     audio_pipeline_register(pipeline->audio_pipeline, pipeline->raw_reader, "raw");
+
+#if !RECORD_HARDWARE_AEC
+    // =========== AEC 引用输入设置 ============
+    if (ringbuf_ref == NULL) {
+        ringbuf_ref = rb_create(ALGORITHM_STREAM_RINGBUFFER_SIZE, 1);
+    }
+    audio_element_set_multi_input_ringbuf(pipeline->algo_aec, ringbuf_ref, 0);
+#endif
 
 #ifdef RTC_DEMO_AUDIO_PIPELINE_CODEC_OPUS
     const char *link_tag[] = {"i2s", "algo", CODEC_NAME, "raw"};
@@ -281,13 +320,20 @@ static audio_element_handle_t create_player_raw_stream(void)
 
 static audio_element_handle_t create_player_i2s_stream(void)
 {
+#ifdef CONFIG_DFROBOT_ESP32S3_AI_CAM
+    i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT_WITH_PARA(I2S_NUM_1, I2S_SAMPLE_RATE, ALGORITHM_STREAM_SAMPLE_BIT, AUDIO_STREAM_WRITER);
+#else
     i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT_WITH_PARA(I2S_NUM_0, I2S_SAMPLE_RATE, ALGORITHM_STREAM_SAMPLE_BIT, AUDIO_STREAM_WRITER);
+#endif
     i2s_cfg.type = AUDIO_STREAM_WRITER;
 #ifdef CONFIG_ESP32_S3_KORVO2_V3_BOARD
     i2s_cfg.need_expand = (16 != 32);
 #endif
     i2s_cfg.out_rb_size = 8 * 1024;
     i2s_cfg.buffer_len = 1416;//708
+#if !RECORD_HARDWARE_AEC
+    i2s_cfg.multi_out_num = 1;
+#endif
     i2s_stream_set_channel_type(&i2s_cfg, CHANNEL_FORMAT);
     audio_element_handle_t stream = i2s_stream_init(&i2s_cfg);
     i2s_stream_set_clk(stream, I2S_SAMPLE_RATE, ALGORITHM_STREAM_SAMPLE_BIT, CHANNEL_NUM);
@@ -332,6 +378,10 @@ player_pipeline_handle_t player_pipeline_open(void) {
     player_pipeline->i2s_stream_writer = create_player_i2s_stream();
     audio_pipeline_register(player_pipeline->audio_pipeline, player_pipeline->i2s_stream_writer, "i2s");
 
+#if !RECORD_HARDWARE_AEC
+    audio_element_set_multi_output_ringbuf(player_pipeline->i2s_stream_writer, ringbuf_ref, 0);
+#endif
+
 #ifndef RTC_DEMO_AUDIO_PIPELINE_CODEC_OPUS
     player_pipeline->rsp = create_resample_stream(CODEC_SAMPLE_RATE, 1, I2S_SAMPLE_RATE, CHANNEL_NUM);
     audio_element_set_output_timeout(player_pipeline->rsp, portMAX_DELAY);
@@ -342,13 +392,14 @@ player_pipeline_handle_t player_pipeline_open(void) {
     if (player_pipeline->audio_decoder != NULL) {
         audio_pipeline_register(player_pipeline->audio_pipeline, player_pipeline->audio_decoder, "dec");
     }
-    
+
+
 #if defined (RTC_DEMO_AUDIO_PIPELINE_CODEC_PCM)
     const char *link_tag[] = {"raw", "rsp", "i2s"};
 #elif defined(RTC_DEMO_AUDIO_PIPELINE_CODEC_OPUS)
 const char *link_tag[] = {"raw", "dec", "i2s"};
 #else
-    const char *link_tag[] = {"raw", "dec", "rsp", "i2s"};
+    const char *link_tag[] = {"raw", "dec",  "rsp", "i2s"};
 #endif
     audio_pipeline_link(player_pipeline->audio_pipeline, &link_tag[0], sizeof(link_tag) / sizeof(link_tag[0]));
 

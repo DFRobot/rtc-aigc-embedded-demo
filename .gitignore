@@ -1,1 +1,7 @@
 __pycache__
+
+client/**/sdkconfig
+client/**/sdkconfig.old
+client/**/build
+client/**/managed_components
+client/**/dependencies.lock
